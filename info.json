@@ -1,0 +1,7 @@
+{
+    "participants": ["Vinícius Felpe"],
+    "social": ["https://github.com/atomosdovini"],
+    "source-code-repo": "https://github.com/atomosdovini/rinha-fraud-go",
+    "stack": ["go", "nginx", "ivf-vector-search"],
+    "open_to_work": false
+}
