@@ -19,7 +19,7 @@ services:
       - backend
 
   api1:
-    image: rinha-fraud-go:latest
+    image: ghcr.io/atomosdovini/rinha-fraud-go:latest
     environment:
       PORT: "8080"
       INDEX_PATH: "/data/index.bin"
@@ -40,7 +40,7 @@ services:
       - backend
 
   api2:
-    image: rinha-fraud-go:latest
+    image: ghcr.io/atomosdovini/rinha-fraud-go:latest
     environment:
       PORT: "8080"
       INDEX_PATH: "/data/index.bin"
