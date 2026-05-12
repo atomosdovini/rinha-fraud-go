@@ -18,8 +18,10 @@ type Block struct {
 }
 
 type Cluster struct {
-	Blocks []Block
-	Count  int
+	Blocks  []Block
+	BboxMin [Dims]int16
+	BboxMax [Dims]int16
+	Count   int
 }
 
 type Index struct {
@@ -89,7 +91,27 @@ func Load(path string) (*Index, error) {
 				off++
 			}
 		}
-		clusters[c] = Cluster{Blocks: blocks, Count: count}
+		// Compute bbox from blocks for geometric pruning.
+		var bmin, bmax [Dims]int16
+		for d := range Dims {
+			bmin[d] = 32767
+			bmax[d] = -32768
+		}
+		for bi := range blocks {
+			b := &blocks[bi]
+			for v := range b.Count {
+				for d := range Dims {
+					val := b.Dims[d][v]
+					if val < bmin[d] {
+						bmin[d] = val
+					}
+					if val > bmax[d] {
+						bmax[d] = val
+					}
+				}
+			}
+		}
+		clusters[c] = Cluster{Blocks: blocks, BboxMin: bmin, BboxMax: bmax, Count: count}
 	}
 
 	idx := &Index{Centroids: centroids, Clusters: clusters}
@@ -98,6 +120,18 @@ func Load(path string) (*Index, error) {
 }
 
 func (idx *Index) IsReady() bool { return idx.ready.Load() }
+
+// Warmup pre-faults all cluster block memory into OS page cache so the first
+// real requests don't pay page-fault latency.
+func (idx *Index) Warmup() {
+	var sum int16
+	for i := range idx.Clusters {
+		for j := range idx.Clusters[i].Blocks {
+			sum += idx.Clusters[i].Blocks[j].Dims[0][0]
+		}
+	}
+	_ = sum
+}
 
 type centEntry struct {
 	idx  int
@@ -121,12 +155,107 @@ type heapBuf struct {
 
 var heapPool = sync.Pool{New: func() any { return &heapBuf{} }}
 
+// bboxLowerBound returns the minimum possible squared distance from q to any
+// vector in the cluster, using the cluster's axis-aligned bounding box.
+func bboxLowerBound(q [Dims]int32, bmin, bmax [Dims]int16) int64 {
+	var lb int64
+	for d := range Dims {
+		mn := int32(bmin[d])
+		mx := int32(bmax[d])
+		var diff int32
+		if q[d] < mn {
+			diff = mn - q[d]
+		} else if q[d] > mx {
+			diff = q[d] - mx
+		}
+		lb += int64(diff * diff)
+	}
+	return lb
+}
+
+// scanCluster accumulates top-k candidates from a single cluster into hb.
+// Returns updated heapMax.
+func scanCluster(cl *Cluster, q [Dims]int32, k int, hb *heapBuf, heapMax int64) int64 {
+	for bi := range cl.Blocks {
+		b := &cl.Blocks[bi]
+		cnt := b.Count
+
+		var p4 [VecsPerBlock]int32
+		for v := range VecsPerBlock {
+			a0 := q[0] - int32(b.Dims[0][v])
+			a1 := q[1] - int32(b.Dims[1][v])
+			a2 := q[2] - int32(b.Dims[2][v])
+			a3 := q[3] - int32(b.Dims[3][v])
+			p4[v] = a0*a0 + a1*a1 + a2*a2 + a3*a3
+		}
+		heapMax32 := int32(min(heapMax, math.MaxInt32))
+
+		anyAlive := false
+		for v := range VecsPerBlock {
+			if p4[v] < heapMax32 {
+				anyAlive = true
+				break
+			}
+		}
+		if !anyAlive {
+			continue
+		}
+
+		var partial [VecsPerBlock]int64
+		for v := range VecsPerBlock {
+			a4 := q[4] - int32(b.Dims[4][v])
+			a5 := q[5] - int32(b.Dims[5][v])
+			a6 := q[6] - int32(b.Dims[6][v])
+			a7 := q[7] - int32(b.Dims[7][v])
+			partial[v] = int64(p4[v]) + int64(a4*a4+a5*a5+a6*a6+a7*a7)
+		}
+
+		anyAlive = false
+		for v := range VecsPerBlock {
+			if partial[v] < heapMax {
+				anyAlive = true
+				break
+			}
+		}
+		if !anyAlive {
+			continue
+		}
+
+		for v := range cnt {
+			if partial[v] >= heapMax {
+				continue
+			}
+			a8 := q[8] - int32(b.Dims[8][v])
+			a9 := q[9] - int32(b.Dims[9][v])
+			a10 := q[10] - int32(b.Dims[10][v])
+			a11 := q[11] - int32(b.Dims[11][v])
+			a12 := q[12] - int32(b.Dims[12][v])
+			a13 := q[13] - int32(b.Dims[13][v])
+			distSq := partial[v] + int64(a8*a8+a9*a9+a10*a10+a11*a11+a12*a12+a13*a13)
+
+			if hb.n < k || distSq < heapMax {
+				lbl := b.Labels[v]
+				if hb.n < k {
+					hb.h[hb.n] = candidate{distSq, lbl}
+					hb.n++
+					heapifyUp(hb.h[:hb.n], hb.n-1)
+				} else {
+					hb.h[0] = candidate{distSq, lbl}
+					heapifyDown(hb.h[:hb.n], 0)
+				}
+				heapMax = hb.h[0].distSq
+			}
+		}
+	}
+	return heapMax
+}
+
 // Search finds the k nearest neighbors using IVF with nprobe clusters.
 // Returns the count of fraud labels among the k nearest.
 func (idx *Index) Search(query [Dims]float32, k, nprobe int) int {
 	numCents := len(idx.Centroids)
 
-	// 1. Compute float32 distances to all centroids
+	// 1. Compute float32 distances to all centroids.
 	sp := centPool.Get().(*[]centEntry)
 	cents := *sp
 	if cap(cents) < numCents {
@@ -154,8 +283,8 @@ func (idx *Index) Search(query [Dims]float32, k, nprobe int) int {
 			d7*d7 + d8*d8 + d9*d9 + d10*d10 + d11*d11 + d12*d12 + d13*d13}
 	}
 
-	// Partial selection sort — top nprobe; copy indices before releasing pool
-	var probeIdx [8]int // nprobe ≤ 8
+	// Partial selection sort — top nprobe.
+	var probeIdx [32]int
 	for i := range nprobe {
 		minJ := i
 		for j := i + 1; j < numCents; j++ {
@@ -169,90 +298,45 @@ func (idx *Index) Search(query [Dims]float32, k, nprobe int) int {
 	*sp = cents
 	centPool.Put(sp)
 
-	// 2. Quantize query to int32
+	// 2. Quantize query to int32.
 	q := QueryInt32(query)
 
-	// 3. Scan probed clusters with early pruning per block
+	// 3. Scan probed clusters with early pruning per block.
 	hb := heapPool.Get().(*heapBuf)
 	hb.n = 0
 	heapMax := int64(math.MaxInt64)
 
 	for _, ci := range probeIdx[:nprobe] {
-		cl := &idx.Clusters[ci]
-		for bi := range cl.Blocks {
-			b := &cl.Blocks[bi]
-			cnt := b.Count
+		heapMax = scanCluster(&idx.Clusters[ci], q, k, hb, heapMax)
+	}
 
-			// 4-dim partial in int32 — fits (max 4×20000²=1.6B < 2.1B), 8×int32 = 1 AVX2 op
-			var p4 [VecsPerBlock]int32
-			for v := range VecsPerBlock {
-				a0 := q[0] - int32(b.Dims[0][v])
-				a1 := q[1] - int32(b.Dims[1][v])
-				a2 := q[2] - int32(b.Dims[2][v])
-				a3 := q[3] - int32(b.Dims[3][v])
-				p4[v] = a0*a0 + a1*a1 + a2*a2 + a3*a3
-			}
-			heapMax32 := int32(min(heapMax, math.MaxInt32))
-
-			anyAlive := false
-			for v := range VecsPerBlock {
-				if p4[v] < heapMax32 {
-					anyAlive = true
-					break
-				}
-			}
-			if !anyAlive {
-				continue
-			}
-
-			// Extend to 8 dims (may exceed int32, use int64)
-			var partial [VecsPerBlock]int64
-			for v := range VecsPerBlock {
-				a4 := q[4] - int32(b.Dims[4][v])
-				a5 := q[5] - int32(b.Dims[5][v])
-				a6 := q[6] - int32(b.Dims[6][v])
-				a7 := q[7] - int32(b.Dims[7][v])
-				partial[v] = int64(p4[v]) + int64(a4*a4+a5*a5+a6*a6+a7*a7)
-			}
-
-			anyAlive = false
-			for v := range VecsPerBlock {
-				if partial[v] < heapMax {
-					anyAlive = true
-					break
-				}
-			}
-			if !anyAlive {
-				continue
-			}
-
-			// Full distance for remaining dims
-			for v := range cnt {
-				if partial[v] >= heapMax {
-					continue
-				}
-				a8 := q[8] - int32(b.Dims[8][v])
-				a9 := q[9] - int32(b.Dims[9][v])
-				a10 := q[10] - int32(b.Dims[10][v])
-				a11 := q[11] - int32(b.Dims[11][v])
-				a12 := q[12] - int32(b.Dims[12][v])
-				a13 := q[13] - int32(b.Dims[13][v])
-				distSq := partial[v] + int64(a8*a8+a9*a9+a10*a10+a11*a11+a12*a12+a13*a13)
-
-				if hb.n < k || distSq < heapMax {
-					lbl := b.Labels[v]
-					if hb.n < k {
-						hb.h[hb.n] = candidate{distSq, lbl}
-						hb.n++
-						heapifyUp(hb.h[:hb.n], hb.n-1)
-					} else {
-						hb.h[0] = candidate{distSq, lbl}
-						heapifyDown(hb.h[:hb.n], 0)
-					}
-					heapMax = hb.h[0].distSq
-				}
-			}
+	fraudCount := 0
+	for i := range hb.n {
+		if hb.h[i].label == 1 {
+			fraudCount++
 		}
+	}
+
+	heapPool.Put(hb)
+	return fraudCount
+}
+
+// SearchAll scans every cluster using bbox lower-bound pruning, returning
+// the fraud count among the k nearest neighbors. Used for ambiguous results.
+func (idx *Index) SearchAll(query [Dims]float32, k int) int {
+	q := QueryInt32(query)
+
+	hb := heapPool.Get().(*heapBuf)
+	hb.n = 0
+	heapMax := int64(math.MaxInt64)
+
+	for ci := range idx.Clusters {
+		cl := &idx.Clusters[ci]
+		// Skip cluster if its bbox lower bound already exceeds current heap worst.
+		if hb.n == k && bboxLowerBound(q, cl.BboxMin, cl.BboxMax) >= heapMax {
+			continue
+		}
+		heapMax = scanCluster(cl, q, k, hb, heapMax)
 	}
 
 	fraudCount := 0
